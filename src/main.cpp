@@ -53,21 +53,25 @@ TilePosition emeraldTilePosition() {
   return position;
 }
 
-void drawPngLine(PNGDRAW *draw) {
-  const int originX = (kScreenWidth - kTileSize) / 2 - (emeraldTilePosition().pixelX - kTileSize / 2);
-  const int originY = (kScreenHeight - kTileSize) / 2 - (emeraldTilePosition().pixelY - kTileSize / 2);
+int drawPngLine(PNGDRAW *draw) {
+  // PNGdec supplies one complete scanline at x=0. Convert its source format
+  // to RGB565 before handing it to TFT_eSPI.
+  static uint16_t linePixels[kTileSize];
+  png.getLineAsRGB565(draw, linePixels, PNG_RGB565_BIG_ENDIAN, 0);
+
+  const TilePosition position = emeraldTilePosition();
+  const int originX = (kScreenWidth - kTileSize) / 2 - (position.pixelX - kTileSize / 2);
+  const int originY = (kScreenHeight - kTileSize) / 2 - (position.pixelY - kTileSize / 2);
   const int y = originY + draw->y;
-  if (y < 0 || y >= kScreenHeight) return;
+  if (y < 0 || y >= kScreenHeight) return 1;
 
-  const int startX = originX + draw->x;
-  const int endX = startX + draw->iWidth;
-  const int visibleStart = max(0, startX);
-  const int visibleEnd = min(kScreenWidth, endX);
-  if (visibleStart >= visibleEnd) return;
-
-  uint16_t *pixels = reinterpret_cast<uint16_t *>(draw->pPixels);
-  tft.pushImage(visibleStart, y, visibleEnd - visibleStart, 1,
-                pixels + (visibleStart - startX));
+  const int visibleStart = max(0, originX);
+  const int visibleEnd = min(kScreenWidth, originX + draw->iWidth);
+  if (visibleStart < visibleEnd) {
+    tft.pushImage(visibleStart, y, visibleEnd - visibleStart, 1,
+                  linePixels + (visibleStart - originX));
+  }
+  return 1;  // Continue decoding subsequent scanlines.
 }
 
 void showMessage(const char *message, uint16_t color = TFT_WHITE) {
@@ -165,7 +169,7 @@ bool fetchLatestRadarTile() {
   }
 
   tft.fillScreen(TFT_BLACK);
-  const int result = png.open(image, contentLength, drawPngLine);
+  const int result = png.openRAM(image, contentLength, drawPngLine);
   if (result == PNG_SUCCESS) {
     png.decode(NULL, 0);
     png.close();
