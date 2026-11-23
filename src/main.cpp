@@ -30,11 +30,16 @@ constexpr int kScreenWidth = 320;
 constexpr int kScreenHeight = 240;
 constexpr int kHeaderHeight = 34;
 constexpr int kFooterHeight = 22;
+constexpr int kMapHeight = kScreenHeight - kHeaderHeight - kFooterHeight;
 constexpr long kUtcOffsetSeconds = 10L * 60L * 60L;
 
 TFT_eSPI tft;
 PNG png;
 uint32_t lastRefresh = 0;
+int mapLeftWorldPixel = 0;
+int mapTopWorldPixel = 0;
+uint32_t drawingTileX = 0;
+uint32_t drawingTileY = 0;
 
 struct TilePosition {
   uint32_t x;
@@ -43,12 +48,16 @@ struct TilePosition {
   int pixelY;
 };
 
-TilePosition emeraldTilePosition() {
+void emeraldWorldPixel(double &worldX, double &worldY) {
   const double worldSize = static_cast<double>(kTileSize) * (1UL << kZoom);
   const double latRad = kEmeraldLatitude * M_PI / 180.0;
-  const double worldX = (kEmeraldLongitude + 180.0) / 360.0 * worldSize;
-  const double worldY = (1.0 - asinh(tan(latRad)) / M_PI) / 2.0 * worldSize;
+  worldX = (kEmeraldLongitude + 180.0) / 360.0 * worldSize;
+  worldY = (1.0 - asinh(tan(latRad)) / M_PI) / 2.0 * worldSize;
+}
 
+TilePosition emeraldTilePosition() {
+  double worldX, worldY;
+  emeraldWorldPixel(worldX, worldY);
   TilePosition position;
   position.x = static_cast<uint32_t>(floor(worldX / kTileSize));
   position.y = static_cast<uint32_t>(floor(worldY / kTileSize));
@@ -61,18 +70,15 @@ int drawPngLine(PNGDRAW *draw) {
   static uint16_t linePixels[kTileSize];
   png.getLineAsRGB565(draw, linePixels, PNG_RGB565_BIG_ENDIAN, 0);
 
-  const TilePosition position = emeraldTilePosition();
-  // Reserve header/footer bands and position Emerald at the center of the map area.
-  const int mapCenterY = kHeaderHeight + (kScreenHeight - kHeaderHeight - kFooterHeight) / 2;
-  const int originX = kScreenWidth / 2 - position.pixelX;
-  const int originY = mapCenterY - position.pixelY;
-  const int y = originY + draw->y;
-  if (y < kHeaderHeight || y >= kScreenHeight - kFooterHeight) return 1;
+  const int originX = static_cast<int>(drawingTileX * kTileSize) - mapLeftWorldPixel;
+  const int originY = static_cast<int>(drawingTileY * kTileSize) - mapTopWorldPixel;
+  const int screenY = originY + draw->y;
+  if (screenY < kHeaderHeight || screenY >= kScreenHeight - kFooterHeight) return 1;
 
   const int visibleStart = max(0, originX);
   const int visibleEnd = min(kScreenWidth, originX + draw->iWidth);
   if (visibleStart < visibleEnd) {
-    tft.pushImage(visibleStart, y, visibleEnd - visibleStart, 1,
+    tft.pushImage(visibleStart, screenY, visibleEnd - visibleStart, 1,
                   linePixels + (visibleStart - originX));
   }
   return 1;
@@ -91,9 +97,10 @@ void drawOverlay(const char *timestamp) {
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString("RAINVIEWER", 5, kScreenHeight - 17, 1);
 
-  // This marker is the Emerald location, centered within the map viewport.
-  const int markerX = kScreenWidth / 2;
-  const int markerY = kHeaderHeight + (kScreenHeight - kHeaderHeight - kFooterHeight) / 2;
+  double worldX, worldY;
+  emeraldWorldPixel(worldX, worldY);
+  const int markerX = static_cast<int>(floor(worldX)) - mapLeftWorldPixel;
+  const int markerY = static_cast<int>(floor(worldY)) - mapTopWorldPixel;
   tft.drawCircle(markerX, markerY, 5, TFT_WHITE);
   tft.drawFastHLine(markerX - 8, markerY, 17, TFT_WHITE);
   tft.drawFastVLine(markerX, markerY - 8, 17, TFT_WHITE);
@@ -128,7 +135,6 @@ bool connectWifi() {
     showMessage("Set WiFi in include/secrets.h", TFT_YELLOW);
     return false;
   }
-
   showMessage("Connecting to WiFi...");
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -137,53 +143,23 @@ bool connectWifi() {
   return WiFi.status() == WL_CONNECTED;
 }
 
-bool fetchLatestRadarTile() {
-  WiFiClientSecure client;
-  // RainViewer uses HTTPS. For production deployments, replace this with certificate validation.
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(15000);
-  if (!http.begin(client, kWeatherMapsUrl)) return false;
-
-  const int status = http.GET();
-  if (status != HTTP_CODE_OK) {
-    Serial.printf("Weather maps request failed: HTTP %d\n", status);
-    http.end();
-    return false;
-  }
-
-  DynamicJsonDocument document(16 * 1024);
-  const DeserializationError jsonError = deserializeJson(document, http.getString());
-  http.end();
-  if (jsonError) {
-    Serial.printf("Could not parse RainViewer metadata: %s\n", jsonError.c_str());
-    return false;
-  }
-
-  const char *host = document["host"] | "";
-  JsonArray past = document["radar"]["past"].as<JsonArray>();
-  if (host[0] == '\0' || past.isNull() || past.size() == 0) return false;
-
-  JsonObject latest = past[past.size() - 1];
-  const char *path = latest["path"] | "";
-  if (path[0] == '\0') return false;
-
-  const TilePosition position = emeraldTilePosition();
-  String tileUrl = String(host) + path + "/256/" + String(kZoom) + "/" +
-                   String(position.x) + "/" + String(position.y) + "/" +
+bool downloadAndDrawTile(HTTPClient &http, WiFiClientSecure &client,
+                         const String &host, const char *path,
+                         uint32_t tileX, uint32_t tileY) {
+  drawingTileX = tileX;
+  drawingTileY = tileY;
+  String tileUrl = host + path + "/256/" + String(kZoom) + "/" +
+                   String(tileX) + "/" + String(tileY) + "/" +
                    String(kRadarColor) + "/" + kTileOptions + ".png";
   Serial.printf("Loading radar tile: %s\n", tileUrl.c_str());
 
-  WiFiClientSecure tileClient;
-  tileClient.setInsecure();
-  if (!http.begin(tileClient, tileUrl)) return false;
-  const int tileStatus = http.GET();
-  if (tileStatus != HTTP_CODE_OK) {
-    Serial.printf("Radar tile request failed: HTTP %d\n", tileStatus);
+  if (!http.begin(client, tileUrl)) return false;
+  const int status = http.GET();
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("Radar tile request failed: HTTP %d\n", status);
     http.end();
     return false;
   }
-
   const int contentLength = http.getSize();
   if (contentLength <= 0 || contentLength > 200000) {
     Serial.printf("Unexpected radar tile size: %d\n", contentLength);
@@ -205,18 +181,64 @@ bool fetchLatestRadarTile() {
     return false;
   }
 
-  tft.fillScreen(TFT_BLACK);
-  const int result = png.openRAM(image, contentLength, drawPngLine);
+  const int openResult = png.openRAM(image, contentLength, drawPngLine);
   bool decoded = false;
-  if (result == PNG_SUCCESS) {
+  if (openResult == PNG_SUCCESS) {
     decoded = png.decode(NULL, 0) == PNG_SUCCESS;
     png.close();
   } else {
-    Serial.printf("PNG decoder open error: %d\n", result);
+    Serial.printf("PNG decoder open error: %d\n", openResult);
+  }
+  free(image);
+  return decoded;
+}
+
+bool fetchLatestRadarTile() {
+  WiFiClientSecure client;
+  // RainViewer uses HTTPS. For production deployments, replace this with certificate validation.
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(15000);
+  if (!http.begin(client, kWeatherMapsUrl)) return false;
+  const int status = http.GET();
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("Weather maps request failed: HTTP %d\n", status);
+    http.end();
+    return false;
   }
 
-  free(image);
-  if (!decoded) return false;
+  DynamicJsonDocument document(16 * 1024);
+  const DeserializationError jsonError = deserializeJson(document, http.getString());
+  http.end();
+  if (jsonError) {
+    Serial.printf("Could not parse RainViewer metadata: %s\n", jsonError.c_str());
+    return false;
+  }
+  const char *hostValue = document["host"] | "";
+  JsonArray past = document["radar"]["past"].as<JsonArray>();
+  if (hostValue[0] == '\0' || past.isNull() || past.size() == 0) return false;
+  JsonObject latest = past[past.size() - 1];
+  const char *path = latest["path"] | "";
+  if (path[0] == '\0') return false;
+
+  double worldX, worldY;
+  emeraldWorldPixel(worldX, worldY);
+  mapLeftWorldPixel = static_cast<int>(floor(worldX - kScreenWidth / 2.0));
+  mapTopWorldPixel = static_cast<int>(floor(worldY - kMapHeight / 2.0));
+  const uint32_t firstTileX = static_cast<uint32_t>(mapLeftWorldPixel / kTileSize);
+  const uint32_t lastTileX = static_cast<uint32_t>((mapLeftWorldPixel + kScreenWidth - 1) / kTileSize);
+  const uint32_t firstTileY = static_cast<uint32_t>(mapTopWorldPixel / kTileSize);
+  const uint32_t lastTileY = static_cast<uint32_t>((mapTopWorldPixel + kMapHeight - 1) / kTileSize);
+
+  tft.fillScreen(TFT_BLACK);
+  const String host(hostValue);
+  bool allTilesDecoded = true;
+  for (uint32_t y = firstTileY; y <= lastTileY; ++y) {
+    for (uint32_t x = firstTileX; x <= lastTileX; ++x) {
+      if (!downloadAndDrawTile(http, client, host, path, x, y)) allTilesDecoded = false;
+    }
+  }
+  if (!allTilesDecoded) return false;
   drawRefreshedOverlay();
   return true;
 }
@@ -227,7 +249,8 @@ void setup() {
   pinMode(kBacklightPin, OUTPUT);
   digitalWrite(kBacklightPin, HIGH);
   tft.init();
-  tft.setRotation(1);
+  // Rotation 3 is the opposite landscape orientation to 1; change this if your USB edge is elsewhere.
+  tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
   showMessage("Starting...");
   WiFi.setSleep(false);
@@ -242,7 +265,7 @@ void loop() {
         showMessage("WiFi connection failed", TFT_RED);
       }
     } else {
-      // Set Queensland time (AEST, UTC+10; no daylight saving) for the refresh label.
+      // Queensland uses AEST (UTC+10) year-round.
       configTime(kUtcOffsetSeconds, 0, "pool.ntp.org", "time.nist.gov");
       if (!fetchLatestRadarTile()) showMessage("Radar unavailable; retrying", TFT_RED);
     }
