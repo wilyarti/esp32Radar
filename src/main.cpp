@@ -7,6 +7,7 @@
 #include <WiFiClientSecure.h>
 #include <math.h>
 #include <stdlib.h>
+#include <time.h>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -27,6 +28,9 @@ constexpr uint32_t kRefreshIntervalMs = 10UL * 60UL * 1000UL;
 constexpr int kBacklightPin = 21;
 constexpr int kScreenWidth = 320;
 constexpr int kScreenHeight = 240;
+constexpr int kHeaderHeight = 34;
+constexpr int kFooterHeight = 22;
+constexpr long kUtcOffsetSeconds = 10L * 60L * 60L;
 
 TFT_eSPI tft;
 PNG png;
@@ -54,16 +58,16 @@ TilePosition emeraldTilePosition() {
 }
 
 int drawPngLine(PNGDRAW *draw) {
-  // PNGdec supplies one complete scanline at x=0. Convert its source format
-  // to RGB565 before handing it to TFT_eSPI.
   static uint16_t linePixels[kTileSize];
   png.getLineAsRGB565(draw, linePixels, PNG_RGB565_BIG_ENDIAN, 0);
 
   const TilePosition position = emeraldTilePosition();
-  const int originX = (kScreenWidth - kTileSize) / 2 - (position.pixelX - kTileSize / 2);
-  const int originY = (kScreenHeight - kTileSize) / 2 - (position.pixelY - kTileSize / 2);
+  // Reserve header/footer bands and position Emerald at the center of the map area.
+  const int mapCenterY = kHeaderHeight + (kScreenHeight - kHeaderHeight - kFooterHeight) / 2;
+  const int originX = kScreenWidth / 2 - position.pixelX;
+  const int originY = mapCenterY - position.pixelY;
   const int y = originY + draw->y;
-  if (y < 0 || y >= kScreenHeight) return 1;
+  if (y < kHeaderHeight || y >= kScreenHeight - kFooterHeight) return 1;
 
   const int visibleStart = max(0, originX);
   const int visibleEnd = min(kScreenWidth, originX + draw->iWidth);
@@ -71,14 +75,49 @@ int drawPngLine(PNGDRAW *draw) {
     tft.pushImage(visibleStart, y, visibleEnd - visibleStart, 1,
                   linePixels + (visibleStart - originX));
   }
-  return 1;  // Continue decoding subsequent scanlines.
+  return 1;
+}
+
+void drawOverlay(const char *timestamp) {
+  tft.fillRect(0, 0, kScreenWidth, kHeaderHeight, TFT_BLACK);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Emerald radar", kScreenWidth - 6, 3, 2);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString(timestamp, kScreenWidth - 6, 21, 1);
+  tft.setTextDatum(TL_DATUM);
+
+  tft.fillRect(0, kScreenHeight - kFooterHeight, kScreenWidth, kFooterHeight, TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("RAINVIEWER", 5, kScreenHeight - 17, 1);
+
+  // This marker is the Emerald location, centered within the map viewport.
+  const int markerX = kScreenWidth / 2;
+  const int markerY = kHeaderHeight + (kScreenHeight - kHeaderHeight - kFooterHeight) / 2;
+  tft.drawCircle(markerX, markerY, 5, TFT_WHITE);
+  tft.drawFastHLine(markerX - 8, markerY, 17, TFT_WHITE);
+  tft.drawFastVLine(markerX, markerY - 8, 17, TFT_WHITE);
+}
+
+void drawRefreshedOverlay() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    drawOverlay("Refreshed: time unavailable");
+    return;
+  }
+  now += kUtcOffsetSeconds;
+  struct tm localTime;
+  gmtime_r(&now, &localTime);
+  char timestamp[32];
+  strftime(timestamp, sizeof(timestamp), "Refreshed %d %b %H:%M", &localTime);
+  drawOverlay(timestamp);
 }
 
 void showMessage(const char *message, uint16_t color = TFT_WHITE) {
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(color, TFT_BLACK);
   tft.setTextDatum(MC_DATUM);
-  tft.drawString("Emerald QLD radar", kScreenWidth / 2, 54, 2);
+  tft.drawString("Emerald radar", kScreenWidth / 2, 54, 2);
   tft.drawCentreString(message, kScreenWidth / 2, 118, 2);
   tft.setTextDatum(TL_DATUM);
 }
@@ -94,9 +133,7 @@ bool connectWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   const uint32_t started = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - started < 20000) {
-    delay(250);
-  }
+  while (WiFi.status() != WL_CONNECTED && millis() - started < 20000) delay(250);
   return WiFi.status() == WL_CONNECTED;
 }
 
@@ -170,23 +207,18 @@ bool fetchLatestRadarTile() {
 
   tft.fillScreen(TFT_BLACK);
   const int result = png.openRAM(image, contentLength, drawPngLine);
+  bool decoded = false;
   if (result == PNG_SUCCESS) {
-    png.decode(NULL, 0);
+    decoded = png.decode(NULL, 0) == PNG_SUCCESS;
     png.close();
-    const int markerX = kScreenWidth / 2;
-    const int markerY = kScreenHeight / 2;
-    tft.drawCircle(markerX, markerY, 5, TFT_WHITE);
-    tft.drawFastHLine(markerX - 8, markerY, 17, TFT_WHITE);
-    tft.drawFastVLine(markerX, markerY - 8, 17, TFT_WHITE);
-    tft.fillRect(0, kScreenHeight - 22, kScreenWidth, 22, TFT_BLACK);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString("EMERALD, QLD  |  RAINVIEWER", 5, kScreenHeight - 18, 1);
   } else {
-    Serial.printf("PNG decoder error: %d\n", result);
+    Serial.printf("PNG decoder open error: %d\n", result);
   }
 
   free(image);
-  return result == PNG_SUCCESS;
+  if (!decoded) return false;
+  drawRefreshedOverlay();
+  return true;
 }
 }  // namespace
 
@@ -209,8 +241,10 @@ void loop() {
       if (WiFi.status() != WL_CONNECTED && strlen(WIFI_SSID) != 0) {
         showMessage("WiFi connection failed", TFT_RED);
       }
-    } else if (!fetchLatestRadarTile()) {
-      showMessage("Radar unavailable; retrying", TFT_RED);
+    } else {
+      // Set Queensland time (AEST, UTC+10; no daylight saving) for the refresh label.
+      configTime(kUtcOffsetSeconds, 0, "pool.ntp.org", "time.nist.gov");
+      if (!fetchLatestRadarTile()) showMessage("Radar unavailable; retrying", TFT_RED);
     }
   }
   delay(100);
